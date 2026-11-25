@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 fltk = { version = "1.5", features = ["fltk-bundled"] }  # bundled for easy cross-platform
-reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "gzip", "brotli"] }
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "gzip", "brotli", "cookies"] }
 html5ever = "0.40"
 markup5ever_rcdom = "0.40"
 lightningcss = "1.0.0-alpha"

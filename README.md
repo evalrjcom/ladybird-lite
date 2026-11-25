@@ -69,31 +69,46 @@ All of this is implemented from web standards (no Blink/WebKit/Gecko code).
 
 | Ladybird Component | This Prototype                          |
 |--------------------|-----------------------------------------|
-| UI                 | FLTK Window + Input + Button + TextDisplay |
-| RequestServer      | reqwest blocking client (timeout, UA)   |
-| HTML Parser        | html5ever + markup5ever_rcdom           |
+| UI                 | FLTK Window + Flex (Back, address bar, Go) + Scroll view |
+| RequestServer      | `src/net.rs`: reqwest blocking client (timeout, cookies, browser UA, GET/POST) |
+| HTML Parser        | `src/page.rs`: html5ever + markup5ever_rcdom → inline flow of words, links and form controls |
+| Layout + Paint     | `src/layout.rs`: word-wrapping inline layout, re-run on resize; text painted with `fltk::draw` |
+| Forms              | Real FLTK widgets placed in the flow; HTML form submission (urlencoded GET/POST) |
 | CSS Engine         | lightningcss (parse + rule count)       |
 | JS Engine          | quickjs-ng via quickjs-rusty            |
-| Rendering          | Extracted text content (basic layout)   |
 | Process isolation  | Single process (future: spawn helpers)  |
 
 ### What Works
 
-- Address bar + Go button (Enter also works)
-- Fetch any HTTP/HTTPS URL with timeout and User-Agent
-- Parse HTML5 into a DOM
-- Extract `<title>`, visible text, `<script>`, and `<style>`
-- Parse CSS with lightningcss
-- Execute `<script>` content in QuickJS
-- Host bindings: `alert()` and `consoleLog()`
+- Address bar + Go button (Enter also works), Back button, optional start URL: `mini-ladybird <url>`
+- Fetch any HTTP/HTTPS URL with timeout, cookies, redirects and a browser-like User-Agent
+- Parse HTML5 into a DOM; extract `<title>` (shown in the window title), `<script>`, `<style>`
+- **Word wrap**: text flows and wraps to the window width and re-wraps on resize; no horizontal
+  scrolling (over-long tokens such as URLs are broken by characters). Headings, bold, monospace,
+  lists, tables (rows → lines), `<pre>`, `<hr>`, `<br>` and image alt text are rendered.
+- **Clickable links**: `<a href>` is resolved against the page URL (and `<base href>`); click to
+  navigate (hand cursor on hover). The Referer header is sent.
+- **Web forms** rendered as real FLTK widgets in document order:
+  `<input type=text|search|email|url|tel|number|… >`, `password`, `hidden`, `checkbox`,
+  `radio` (exclusive per form + name), `submit`/`image`, `<button>`, `<textarea>`,
+  `<select>`/`<option>`/`<optgroup>`
+- **Form submission** per the HTML algorithm: successful controls in tree order, `name=value`
+  urlencoded (`application/x-www-form-urlencoded`), `method=GET` (query string replaces the
+  action's query) or `POST` (request body), `action` resolved against the page URL (empty → current
+  page). Pressing **Enter in a text field submits its form** (implicit submission uses the first
+  submit button as submitter). Example: open `https://duckduckgo.com/lite/`, type a query, press Enter.
+- Parse CSS with lightningcss; execute inline `<script>` in QuickJS (`alert()`, `consoleLog()`)
 - Dark themed FLTK UI
 
 ### Limitations (intentional for a from-scratch prototype)
 
-- No full CSS layout/painting (text extraction only)
-- No DOM mutation from JS beyond host callbacks
-- No images, forms, or advanced web APIs
-- Single process
+- CSS is parsed but **not applied** (no colours, `display:none`, positioning, floats or columns), so
+  menus and elements hidden by CSS are shown, and layout is a single flowing column
+- JavaScript has no DOM: pages that build their UI with JS will not work; JS-only form handlers
+  (`onsubmit`, `fetch`) are ignored
+- No images (alt text only), no `multipart/form-data` / file upload, no `<input type=reset>` behaviour
+- In-page `#anchor` links don't scroll yet; Back re-requests the previous page (POST is re-sent)
+- Networking is blocking on the UI thread; single process
 - Basic error handling
 
 ## Building & Running
@@ -101,11 +116,15 @@ All of this is implemented from web standards (no Blink/WebKit/Gecko code).
 ### Prerequisites
 
 - Rust 1.70+ (stable)
-- On Linux: development packages for FLTK (usually handled by fltk-bundled)
+- On Linux: X11/Xft/Pango/Cairo development packages (FLTK is bundled, but links against them), e.g.
+  `sudo apt-get install libx11-dev libxext-dev libxft-dev libxinerama-dev libxcursor-dev libxrender-dev libxfixes-dev libfontconfig1-dev libpango1.0-dev libcairo2-dev libgl1-mesa-dev libglu1-mesa-dev`
+  and `libclang-dev` (bindgen for QuickJS)
 - On Windows: MSVC or MinGW toolchain
 
 ```bash
-cargo run --release
+cargo run --release                                  # opens with the DuckDuckGo Lite URL prefilled
+cargo run --release -- https://duckduckgo.com/lite/  # load a page at startup
+cargo test                                           # parser + form-encoding unit tests
 ```
 
 The binary is self-contained thanks to `fltk-bundled`.
