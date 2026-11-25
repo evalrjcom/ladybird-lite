@@ -1,6 +1,6 @@
 /target
 **/*.rs.bk
-Cargo.lock
+# AUDIT FIX: Cargo.lock is no longer ignored — binaries should commit it (reproducible builds, CI cache key).
 *.exe
 *.pdb
 .DS_Store

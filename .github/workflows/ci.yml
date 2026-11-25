@@ -14,7 +14,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      # AUDIT FIX: v4 actions run on the deprecated Node 20 runtime; v7/v6/v7 run on Node 24.
+      - uses: actions/checkout@v7
 
       - name: Install Linux system deps (X11/Pango/Cairo for FLTK)
         if: runner.os == 'Linux'
@@ -28,23 +29,35 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
+          # AUDIT FIX: Cargo.lock was gitignored, so this hash was always empty and the cache never
+          # invalidated; the lockfile is now committed (reproducible builds for a binary crate).
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
       - name: Build release
-        run: cargo build --release --verbose
+        run: cargo build --release --locked --verbose
+
+      # AUDIT FIX: CI only built; the unit tests and lints never ran.
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --release --locked --all-targets -- -D warnings
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mini-ladybird-${{ matrix.os }}
           path: |

@@ -81,28 +81,44 @@ All of this is implemented from web standards (no Blink/WebKit/Gecko code).
 ### What Works
 
 - Address bar + Go button (Enter also works), Back button, optional start URL: `mini-ladybird <url>`
-- Fetch any HTTP/HTTPS URL with timeout, cookies, redirects and a browser-like User-Agent
+- Fetch any HTTP/HTTPS URL with connect/overall timeouts, cookies, up to 10 redirects, gzip/brotli
+  and a browser-like User-Agent. Bodies are streamed with an **8 MiB cap** (the page is marked
+  truncated). Text is decoded using the `Content-Type` charset, a `<meta charset>` prescan, BOM or
+  UTF-8 (Latin-1, Shift_JIS, … display correctly)
+- Content routing: HTML/XHTML is rendered, `text/*` and JSON are shown as plain text, other types
+  (images, binaries) show a "can't display" notice instead of garbage
+- **Omnibox**: typing words (not a URL) in the address bar searches DuckDuckGo Lite; `example.com`
+  gets `https://` added
 - Parse HTML5 into a DOM; extract `<title>` (shown in the window title), `<script>`, `<style>`
 - **Word wrap**: text flows and wraps to the window width and re-wraps on resize; no horizontal
   scrolling (over-long tokens such as URLs are broken by characters). Headings, bold, monospace,
   lists, tables (rows → lines), `<pre>`, `<hr>`, `<br>` and image alt text are rendered.
-- **Clickable links**: `<a href>` is resolved against the page URL (and `<base href>`); click to
-  navigate (hand cursor on hover). The Referer header is sent.
+- **Clickable links**: `<a href>` is resolved against the page URL (and the first `<base href>`);
+  click to navigate (hand cursor on hover). `#fragment` links scroll to the matching `id` /
+  `<a name>`. The Referer follows `strict-origin-when-cross-origin` (no fragment/credentials,
+  origin only cross-site, nothing on https→http).
 - **Web forms** rendered as real FLTK widgets in document order:
   `<input type=text|search|email|url|tel|number|… >`, `password`, `hidden`, `checkbox`,
   `radio` (exclusive per form + name), `submit`/`image`, `<button>`, `<textarea>`,
-  `<select>`/`<option>`/`<optgroup>`
+  `<select>`/`<option>`/`<optgroup>`, `<select multiple>` (list box); `disabled`, `readonly`,
+  `maxlength`, `autofocus`, `<fieldset disabled>` and the `form=` attribute are honoured
 - **Form submission** per the HTML algorithm: successful controls in tree order, `name=value`
-  urlencoded (`application/x-www-form-urlencoded`), `method=GET` (query string replaces the
+  urlencoded (`application/x-www-form-urlencoded`) or `multipart/form-data`; the submitter's
+  `formaction`/`formmethod`/`formenctype` override the form; image buttons send `name.x/name.y`; `method=GET` (query string replaces the
   action's query) or `POST` (request body), `action` resolved against the page URL (empty → current
-  page). Pressing **Enter in a text field submits its form** (implicit submission uses the first
+  page). After a POST, **Back asks before re-sending the form data**; a POST→303 redirect result is a
+  normal GET page. Pressing **Enter in a text field submits its form** (implicit submission uses the first
   submit button as submitter). Example: open `https://duckduckgo.com/lite/`, type a query, press Enter.
 - **Keyboard scrolling that works whatever has focus**: PageDown/PageUp scroll one screen (minus a
   40px overlap) even while typing in the search box or the URL bar; Home/End, ↑/↓ and
   Space/Shift+Space scroll when focus isn't in a text field (click the page text to leave a field).
   A `<textarea>` keeps PageUp/PageDown only when its own text overflows. The mouse wheel scrolls
   ~3 lines per notch. Logic and unit tests live in `src/scrolling.rs`.
-- Parse CSS with lightningcss; execute inline `<script>` in QuickJS (`alert()`, `consoleLog()`)
+- Parse CSS with lightningcss; execute inline classic `<script>` in QuickJS (`alert()`, `consoleLog()`)
+  in a **fresh context per page** with a 32 MB heap limit and a 1.5 s time budget (infinite loops are
+  interrupted), and at most 3 alerts per page
+- Hostile-page hardening: deep nesting (100k+ elements), megabyte-long words and huge pages load in
+  well under 2 s with bounded memory; `@` in titles/labels is shown literally
 - Dark themed FLTK UI
 
 ### Limitations (intentional for a from-scratch prototype)
@@ -111,8 +127,8 @@ All of this is implemented from web standards (no Blink/WebKit/Gecko code).
   menus and elements hidden by CSS are shown, and layout is a single flowing column
 - JavaScript has no DOM: pages that build their UI with JS will not work; JS-only form handlers
   (`onsubmit`, `fetch`) are ignored
-- No images (alt text only), no `multipart/form-data` / file upload, no `<input type=reset>` behaviour
-- In-page `#anchor` links don't scroll yet; Back re-requests the previous page (POST is re-sent)
+- No images (alt text only), no file upload (`<input type=file>`), no `<input type=reset>` behaviour
+- Back re-requests the previous page (no page cache)
 - Networking is blocking on the UI thread; single process
 - Basic error handling
 
@@ -120,7 +136,7 @@ All of this is implemented from web standards (no Blink/WebKit/Gecko code).
 
 ### Prerequisites
 
-- Rust 1.70+ (stable)
+- A recent stable Rust (tested with 1.100; 1.85 is too old for the current dependencies)
 - On Linux: X11/Xft/Pango/Cairo development packages (FLTK is bundled, but links against them), e.g.
   `sudo apt-get install libx11-dev libxext-dev libxft-dev libxinerama-dev libxcursor-dev libxrender-dev libxfixes-dev libfontconfig1-dev libpango1.0-dev libcairo2-dev libgl1-mesa-dev libglu1-mesa-dev`
   and `libclang-dev` (bindgen for QuickJS)
@@ -129,7 +145,7 @@ All of this is implemented from web standards (no Blink/WebKit/Gecko code).
 ```bash
 cargo run --release                                  # opens with the DuckDuckGo Lite URL prefilled
 cargo run --release -- https://duckduckgo.com/lite/  # load a page at startup
-cargo test                                           # parser + form-encoding unit tests
+cargo test                                           # parser, layout, net, form and scrolling tests
 ```
 
 The binary is self-contained thanks to `fltk-bundled`.

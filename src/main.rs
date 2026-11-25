@@ -4,7 +4,7 @@
 //! Architecture mapping (single-process for the prototype; modular for future isolation):
 //! - UI layer: FLTK (address bar, navigation, scrollable content view)
 //! - Network (`net`): reqwest (HTTP/1.1 + HTTP/2, rustls, cookies, compression)
-//! - HTML (`page`): html5ever (WHATWG parser) → RcDom → inline flow of words + form controls
+//! - HTML (`page`): html5ever (WHATWG parser) → `RcDom` → inline flow of words + form controls
 //! - Layout/paint (`layout`): word-wrapping inline layout, re-run on resize
 //! - CSS: lightningcss (parsed, not yet applied)
 //! - JavaScript: quickjs-ng via quickjs-rusty
@@ -22,6 +22,7 @@ mod scrolling;
 use anyhow::{Context, Result};
 use fltk::{
     app,
+    browser::MultiBrowser,
     button::{Button, CheckButton, RoundButton},
     enums::{Align, CallbackTrigger, Color, Cursor, Event, Font, FrameType},
     frame::Frame,
@@ -39,19 +40,35 @@ use page::{ControlKind, Page};
 use quickjs_rusty::Context as JsContext;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use url::Url;
 
-#[derive(Debug, Clone)]
+// AUDIT FIX: unbounded session history (each entry may hold a POST body).
+const MAX_HISTORY: usize = 100;
+// AUDIT FIX: page scripts ran with no time/memory limit — `while(true){}` froze the UI forever.
+const JS_TIME_LIMIT: Duration = Duration::from_millis(1500);
+const JS_MEMORY_LIMIT: usize = 32 * 1024 * 1024;
+/// Max `alert()` dialogs per page (a page looping on `alert()` was an endless modal loop).
+const MAX_ALERTS_PER_PAGE: u32 = 3;
+/// Search used when the address bar text isn't a URL.
+const SEARCH_URL: &str = "https://lite.duckduckgo.com/lite/";
+
+// AUDIT FIX: page-bound messages carry the page generation they were created for. Messages are
+// queued, so a double-click on a link (or a radio click racing a navigation) used to index into the
+// *next* page's links/controls: wrong navigation, or an out-of-bounds panic in radio_toggled.
+#[derive(Debug, Clone, Copy)]
 enum Msg {
     /// Navigate to whatever is in the address bar.
     Go,
     Back,
-    /// Follow link `idx` of the current page.
-    Link(usize),
+    /// Follow link `idx` of page generation `page_gen`.
+    Link { page_gen: u64, idx: usize },
     /// Submit form `form`, optionally via the submit button control `submitter`.
-    Submit { form: usize, submitter: Option<usize> },
+    Submit { page_gen: u64, form: usize, submitter: Option<usize> },
     /// A radio button was toggled: enforce exclusivity within its group.
-    Radio(usize),
+    Radio { page_gen: u64, idx: usize },
     Relayout,
 }
 
@@ -64,6 +81,8 @@ enum Ctl {
     Radio(RoundButton),
     Button(Button),
     Choice(Choice),
+    // AUDIT FIX: <select multiple>/size>1 rendered as a list box (multi-selection was impossible).
+    List(MultiBrowser),
 }
 
 impl Ctl {
@@ -76,6 +95,7 @@ impl Ctl {
             Ctl::Radio(w) => w.as_base_widget(),
             Ctl::Button(w) => w.as_base_widget(),
             Ctl::Choice(w) => w.as_base_widget(),
+            Ctl::List(w) => w.as_base_widget(),
         }
     }
 }
@@ -94,8 +114,12 @@ struct Browser {
     history: Vec<Request>,
     widgets: Vec<Option<Ctl>>,
     layout: Rc<RefCell<Layout>>,
+    /// Incremented on every page change; see [`Msg`].
+    page_gen: u64,
+    page_gen_cell: Rc<std::cell::Cell<u64>>,
 }
 
+#[allow(clippy::too_many_lines)] // linear UI construction; splitting it hurts readability
 fn main() -> Result<()> {
     env_logger::init();
     let app = app::App::default().with_scheme(app::Scheme::Gtk);
@@ -157,6 +181,8 @@ fn main() -> Result<()> {
 
     // Text layer: draws the laid-out words; clicks on links navigate.
     let layout = Rc::new(RefCell::new(Layout::default()));
+    // Shared with the canvas handler so link clicks are tagged with the current page generation.
+    let page_gen_cell = Rc::new(std::cell::Cell::new(0_u64));
     {
         let l = layout.clone();
         let s = sender;
@@ -168,17 +194,19 @@ fn main() -> Result<()> {
                     s.send(Msg::Relayout);
                 }
             }
-            layout::paint(&l, c.x(), c.y(), c.w(), c.h());
+            // Visible rows in layout coordinates (the scroll area clips the canvas).
+            let (top, bottom) = c.parent().map_or((0, c.h()), |p| (p.y() - c.y(), p.y() - c.y() + p.h()));
+            layout::paint(&l, c.x(), c.y(), c.w(), c.h(), top, bottom);
         });
     }
     {
         let l = layout.clone();
         let s = sender;
         let mut sc = scroll.clone();
+        let page_gen = page_gen_cell.clone();
         canvas.handle(move |c, ev| {
             let hit = || layout::link_at(&l.borrow(), app::event_x() - c.x(), app::event_y() - c.y());
             match ev {
-                Event::Enter => true,
                 Event::Move => {
                     let cur = if hit().is_some() { Cursor::Hand } else { Cursor::Default };
                     if let Some(mut w) = c.window() {
@@ -194,7 +222,7 @@ fn main() -> Result<()> {
                 }
                 // The page itself can hold focus (like a browser's document), so clicking
                 // text leaves a form field and Space/arrows scroll the page again.
-                Event::Focus | Event::Unfocus => true,
+                Event::Enter | Event::Focus | Event::Unfocus => true,
                 // Handle page keys here, before FLTK's group arrow-key focus navigation.
                 Event::KeyDown => page_key(&mut sc, &l),
                 Event::Push => {
@@ -204,8 +232,8 @@ fn main() -> Result<()> {
                     true
                 }
                 Event::Released => {
-                    if let Some(i) = hit() {
-                        s.send(Msg::Link(i));
+                    if let Some(idx) = hit() {
+                        s.send(Msg::Link { page_gen: page_gen.get(), idx });
                     }
                     true
                 }
@@ -233,15 +261,7 @@ fn main() -> Result<()> {
     url_input.emit(sender, Msg::Go);
     win.resize_callback(move |_, _, _, _, _| sender.send(Msg::Relayout));
 
-    let js_ctx = JsContext::builder().build().context("Failed to create QuickJS context")?;
-    js_ctx.add_callback("alert", |msg: String| {
-        fltk::dialog::alert_default(&msg);
-        true
-    })?;
-    js_ctx.add_callback("consoleLog", |msg: String| {
-        eprintln!("[JS] {}", msg);
-        true
-    })?;
+    let js_ctx = new_js_context()?;
 
     let mut b = Browser {
         win,
@@ -257,6 +277,8 @@ fn main() -> Result<()> {
         history: Vec::new(),
         widgets: Vec::new(),
         layout,
+        page_gen: 0,
+        page_gen_cell,
     };
     b.show_page();
 
@@ -272,6 +294,70 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Wall-clock deadline (ms since process start) checked by the `QuickJS` interrupt handler.
+static JS_DEADLINE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+static JS_ALERTS: AtomicU32 = AtomicU32::new(0);
+
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// `QuickJS` calls this periodically while running; non-zero aborts the script.
+unsafe extern "C" fn js_interrupt(_: *mut quickjs_rusty::JSContext, _: *mut std::ffi::c_void) -> std::ffi::c_int {
+    std::ffi::c_int::from(now_ms() > JS_DEADLINE_MS.load(Ordering::Relaxed))
+}
+
+// AUDIT FIX: one QuickJS context was shared by every page, so globals defined by site A were
+// readable by site B (cross-origin state leak). A fresh, memory-capped, interruptible context is
+// now created per page.
+fn new_js_context() -> Result<JsContext> {
+    let ctx = JsContext::builder()
+        .memory_limit(JS_MEMORY_LIMIT)
+        .build()
+        .context("Failed to create QuickJS context")?;
+    ctx.set_interrupt_handler(Some(js_interrupt), std::ptr::null_mut());
+    ctx.add_callback("alert", |msg: String| {
+        if JS_ALERTS.fetch_add(1, Ordering::Relaxed) < MAX_ALERTS_PER_PAGE {
+            fltk::dialog::alert_default(&msg);
+        }
+        true
+    })?;
+    ctx.add_callback("consoleLog", |msg: String| {
+        eprintln!("[JS] {msg}");
+        true
+    })?;
+    Ok(ctx)
+}
+
+/// FLTK labels interpret `@` as a symbol prefix (`@->` draws an arrow); escape it for literal text.
+// AUDIT FIX: URLs such as https://x.com/@user rendered garbage in the status bar / buttons / menus.
+fn label_escape(s: &str) -> String {
+    s.replace('@', "@@")
+}
+
+/// Address-bar text → URL. Text that doesn't look like a URL becomes a web search.
+// AUDIT FIX: typing words ("rust fltk") produced "Invalid URL" (https://rust fltk).
+fn omnibox_url(raw: &str) -> Option<Url> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.contains("://") {
+        return Url::parse(raw).ok();
+    }
+    let looks_like_host = !raw.contains(char::is_whitespace)
+        && (raw.contains('.') || raw.starts_with("localhost") || raw.contains(':'));
+    if looks_like_host {
+        if let Ok(u) = Url::parse(&format!("https://{raw}")) {
+            return Some(u);
+        }
+    }
+    let mut u = Url::parse(SEARCH_URL).ok()?;
+    u.query_pairs_mut().append_pair("q", raw);
+    Some(u)
 }
 
 /// Run [`page_key`] before `w`'s own key handling.
@@ -311,16 +397,13 @@ fn classify_focus(w: &Widget) -> scrolling::Focus {
         // Does the text overflow the box (so the textarea needs its own PageUp/Down)?
         let ta = unsafe { MultilineInput::from_widget_ptr(p) };
         fltk::draw::set_font(ta.text_font(), ta.text_size());
-        let inner_w = (ta.w() - 8).max(1) as f64;
-        let lines: i32 = ta
-            .value()
-            .split('\n')
-            .map(|line| ((fltk::draw::width(line) / inner_w).ceil() as i32).max(1))
-            .sum();
-        Focus::TextArea { scrollable: lines * fltk::draw::height() > ta.h() - 4 }
+        let inner_w = f64::from((ta.w() - 8).max(1));
+        // AUDIT FIX: summed in f64 (no i32 truncation/overflow for huge pasted text).
+        let lines: f64 = ta.value().split('\n').map(|line| (fltk::draw::width(line) / inner_w).ceil().max(1.0)).sum();
+        Focus::TextArea { scrollable: lines * f64::from(fltk::draw::height()) > f64::from(ta.h() - 4) }
     } else if is_ptr_of::<Input>(p) || is_ptr_of::<SecretInput>(p) {
         Focus::TextField
-    } else if is_ptr_of::<Choice>(p) {
+    } else if is_ptr_of::<Choice>(p) || is_ptr_of::<MultiBrowser>(p) {
         Focus::Choice
     } else if is_ptr_of::<Button>(p) || is_ptr_of::<CheckButton>(p) || is_ptr_of::<RoundButton>(p) {
         Focus::Button
@@ -329,39 +412,61 @@ fn classify_focus(w: &Widget) -> scrolling::Focus {
     }
 }
 
+/// `maxlength` / `readonly` for text widgets.
+fn apply_text_attrs<I: InputExt>(w: &mut I, maxlength: Option<usize>, readonly: bool) {
+    if let Some(n) = maxlength.and_then(|n| i32::try_from(n).ok()) {
+        w.set_maximum_size(n);
+    }
+    w.set_readonly(readonly);
+}
+
 impl Browser {
     fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Go => {
-                let raw = self.url_input.value();
-                let raw = raw.trim();
-                let fixed = if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") };
-                match Url::parse(&fixed) {
-                    Ok(u) => self.load(Request::get(u), true),
-                    Err(e) => self.status.set_label(&format!("Invalid URL: {e}")),
-                }
-            }
+            Msg::Go => match omnibox_url(&self.url_input.value()) {
+                Some(u) => self.load(Request::get(u), true),
+                None => self.set_status("Type a URL or search terms"),
+            },
             Msg::Back => {
-                if let Some(prev) = self.history.pop() {
-                    self.load(prev, false);
+                let Some(prev) = self.history.pop() else {
+                    self.set_status("No previous page");
+                    return;
+                };
+                // AUDIT FIX: Back silently re-sent POST bodies (duplicate orders/messages). Ask first.
+                if prev.form_body.is_some() {
+                    let answer = fltk::dialog::choice2_default(
+                        "The previous page was the result of a form submission.\nResend the form data?",
+                        "Cancel",
+                        "Resend",
+                        "",
+                    );
+                    if answer != Some(1) {
+                        self.history.push(prev);
+                        return;
+                    }
                 }
+                self.load(prev, false);
             }
-            Msg::Link(i) => {
-                if let Some(u) = self.page.links.get(i).cloned() {
+            Msg::Link { page_gen, idx } if page_gen == self.page_gen => {
+                if let Some(u) = self.page.links.get(idx).cloned() {
                     if self.is_same_document_fragment(&u) {
-                        self.status.set_label(&format!("(in-page anchor) {u}"));
+                        self.scroll_to_fragment(u.fragment().unwrap_or(""));
                         return;
                     }
                     let referer = self.current.as_ref().map(|r| r.url.clone());
                     self.load(Request { url: u, form_body: None, referer }, true);
                 }
             }
-            Msg::Submit { form, submitter } => {
-                if let Some(req) = self.form_submission(form, submitter) {
-                    self.load(req, true);
+            Msg::Submit { page_gen, form, submitter } if page_gen == self.page_gen => {
+                match self.form_submission(form, submitter) {
+                    Some(req) => self.load(req, true),
+                    None => self.set_status("This form can't be submitted (method=dialog or invalid)"),
                 }
             }
-            Msg::Radio(i) => self.radio_toggled(i),
+            Msg::Radio { page_gen, idx } if page_gen == self.page_gen => self.radio_toggled(idx),
+            Msg::Link { .. } | Msg::Submit { .. } | Msg::Radio { .. } => {
+                log::debug!("dropping stale message {msg:?}");
+            }
             Msg::Relayout => {
                 if (self.scroll.w(), self.scroll.h()) != self.layout.borrow().viewport {
                     self.relayout();
@@ -377,35 +482,67 @@ impl Browser {
         })
     }
 
+    fn set_status(&mut self, text: &str) {
+        self.status.set_label(&label_escape(text));
+    }
+
+    fn push_history(&mut self) {
+        if let Some(cur) = self.current.take() {
+            self.history.push(cur);
+            if self.history.len() > MAX_HISTORY {
+                self.history.remove(0);
+            }
+        }
+    }
+
     fn load(&mut self, req: Request, push_history: bool) {
         if !matches!(req.url.scheme(), "http" | "https") {
-            self.status.set_label(&format!("Unsupported scheme: {}", req.url.scheme()));
+            self.set_status(&format!("Can't open {}: links ({})", req.url.scheme(), req.url));
             return;
         }
         let verb = if req.form_body.is_some() { "POST" } else { "GET" };
-        self.status.set_label(&format!("{verb} {} …", req.url));
+        self.set_status(&format!("{verb} {} …", req.url));
         self.win.set_cursor(Cursor::Wait);
         app::flush();
 
         let result = net::fetch(&self.client, &req);
         self.win.set_cursor(Cursor::Default);
+        if push_history {
+            self.push_history();
+        }
         match result {
             Ok(resp) => {
-                let page = page::parse(&resp.body, &resp.url)
-                    .unwrap_or_else(|e| Page::message("Parse error", &e.to_string()));
+                // AUDIT FIX: everything was parsed as HTML — images/binaries became screens of
+                // garbage text and text/plain lost its line breaks.
+                let is_html = resp.mime.is_empty() || resp.mime.contains("html") || resp.mime.ends_with("xml");
+                let page = if is_html {
+                    page::parse(&resp.body, &resp.url).unwrap_or_else(|e| Page::message("Parse error", &e.to_string()))
+                } else if resp.mime.starts_with("text/") || resp.mime == "application/json" {
+                    Page::plain_text(&resp.body)
+                } else {
+                    Page::message(
+                        "Can't display this content",
+                        &format!("{} is {} ({} bytes). Only HTML and text are supported.", resp.url, resp.mime, resp.body.len()),
+                    )
+                };
                 self.url_input.set_value(resp.url.as_str());
-                if push_history {
-                    if let Some(cur) = self.current.take() {
-                        self.history.push(cur);
-                    }
-                }
-                // Keep the method/body so Back can re-show POST results (e.g. DDG lite).
-                self.current = Some(Request { url: resp.url.clone(), ..req });
+                // Keep the method/body so Back can re-show POST results (e.g. DDG lite) — unless the
+                // server redirected (POST → 303 → GET), in which case the document is a plain GET.
+                let form_body = if resp.redirected { None } else { req.form_body };
+                // AUDIT FIX: the status bar said "POST 200 /after" for a POST→303→GET result.
+                let verb = if form_body.is_some() { "POST" } else { "GET" };
+                self.current = Some(Request { url: resp.url.clone(), form_body, referer: req.referer });
                 self.page = page;
-                self.run_page_resources();
+                if is_html {
+                    self.run_page_resources();
+                }
                 self.show_page();
-                self.status.set_label(&format!(
-                    "{verb} {} {} — {} links, {} form(s)",
+                if let Some(frag) = resp.url.fragment() {
+                    self.scroll_to_fragment(frag);
+                }
+                let note = if resp.truncated || self.page.truncated { " — page truncated (too large)" } else { "" };
+                self.set_status(&format!(
+                    "{verb} {} {} — {} links, {} form(s){note}",
                     resp.status,
                     resp.url,
                     self.page.links.len(),
@@ -413,10 +550,34 @@ impl Browser {
                 ));
             }
             Err(e) => {
+                // AUDIT FIX: the failed request becomes the current entry, so Back returns to the
+                // page you were on (previously Back skipped it) and Go/Enter retries.
+                self.current = Some(req.clone());
                 self.page = Page::message("Navigation failed", &format!("{}\n{:#}", req.url, e));
                 self.show_page();
-                self.status.set_label(&format!("Error: {e:#}"));
+                self.set_status(&format!("Error: {e:#}"));
             }
+        }
+    }
+
+    /// Scroll so the element with this id / name is at the top (`#` or `#top` → page top).
+    fn scroll_to_fragment(&mut self, frag: &str) {
+        let decoded = url::form_urlencoded::parse(format!("x={frag}").as_bytes())
+            .next()
+            .map_or_else(|| frag.to_string(), |(_, v)| v.into_owned());
+        let y = {
+            let l = self.layout.borrow();
+            l.anchors.get(frag).or_else(|| l.anchors.get(&decoded)).copied().or_else(|| {
+                (frag.is_empty() || frag.eq_ignore_ascii_case("top")).then_some(0)
+            })
+        };
+        match y {
+            Some(y) => {
+                let max = (self.layout.borrow().height - self.scroll.h()).max(0);
+                self.scroll.scroll_to(0, y.clamp(0, max));
+                self.scroll.redraw();
+            }
+            None => self.set_status(&format!("No anchor #{frag} on this page")),
         }
     }
 
@@ -424,23 +585,40 @@ impl Browser {
         for css in &self.page.styles {
             match StyleSheet::parse(css, ParserOptions::default()) {
                 Ok(sheet) => log::info!("Parsed CSS stylesheet with {} rules", sheet.rules.0.len()),
-                Err(e) => log::warn!("CSS parse error: {:?}", e),
+                Err(e) => log::warn!("CSS parse error: {e:?}"),
             }
         }
+        if self.page.scripts.is_empty() {
+            return;
+        }
+        match new_js_context() {
+            Ok(ctx) => self.js_ctx = ctx,
+            Err(e) => {
+                log::warn!("JS disabled for this page: {e}");
+                return;
+            }
+        }
+        JS_ALERTS.store(0, Ordering::Relaxed);
         for script in &self.page.scripts {
+            JS_DEADLINE_MS.store(now_ms() + u64::try_from(JS_TIME_LIMIT.as_millis()).unwrap_or(1500), Ordering::Relaxed);
             if let Err(e) = self.js_ctx.eval(script, false) {
-                log::warn!("JS error: {}", e);
+                log::warn!("JS error: {e}");
             }
         }
+        JS_DEADLINE_MS.store(u64::MAX, Ordering::Relaxed);
     }
 
     /// Replace form widgets for the new page and lay everything out.
+    #[allow(clippy::too_many_lines)] // one arm per control kind
     fn show_page(&mut self) {
         for w in self.widgets.drain(..).flatten() {
             let base = w.base();
             self.scroll.remove(&base);
             app::delete_widget(base);
         }
+        self.page_gen += 1;
+        self.page_gen_cell.set(self.page_gen);
+        let page_gen = self.page_gen;
         let title = self.page.title.clone().unwrap_or_else(|| "(untitled)".into());
         self.win.set_label(&format!("{title} — Mini Ladybird"));
 
@@ -448,26 +626,28 @@ impl Browser {
         let s = self.sender;
         for (i, spec) in self.page.controls.iter().enumerate() {
             let form = spec.form;
-            let submit = move |submitter: Option<usize>| form.map(|form| Msg::Submit { form, submitter });
+            let submit = move |submitter: Option<usize>| form.map(|form| Msg::Submit { page_gen, form, submitter });
             let mut ctl = match &spec.kind {
                 ControlKind::Hidden { .. } => None,
-                ControlKind::Text { value, password, .. } => {
+                ControlKind::Text { value, password, maxlength, .. } => {
                     // Enter in a text field submits its form (implicit submission).
                     let msg = submit(None);
                     if *password {
                         let mut w = SecretInput::default();
                         w.set_value(value);
+                        apply_text_attrs(&mut w, *maxlength, spec.readonly);
                         w.set_trigger(CallbackTrigger::EnterKeyAlways);
                         if let Some(m) = msg {
-                            w.set_callback(move |_| s.send(m.clone()));
+                            w.set_callback(move |_| s.send(m));
                         }
                         Some(Ctl::Secret(w))
                     } else {
                         let mut w = Input::default();
                         w.set_value(value);
+                        apply_text_attrs(&mut w, *maxlength, spec.readonly);
                         w.set_trigger(CallbackTrigger::EnterKeyAlways);
                         if let Some(m) = msg {
-                            w.set_callback(move |_| s.send(m.clone()));
+                            w.set_callback(move |_| s.send(m));
                         }
                         Some(Ctl::Text(w))
                     }
@@ -476,6 +656,7 @@ impl Browser {
                     let mut w = MultilineInput::default();
                     w.set_value(value);
                     w.set_wrap(true);
+                    apply_text_attrs(&mut w, None, spec.readonly);
                     Some(Ctl::Area(w))
                 }
                 ControlKind::Checkbox { checked, .. } => {
@@ -490,33 +671,52 @@ impl Browser {
                     w.set_value(*checked);
                     w.set_color(layout::BG);
                     w.set_selection_color(Color::from_rgb(120, 175, 255));
-                    w.set_callback(move |_| s.send(Msg::Radio(i)));
+                    w.set_callback(move |_| s.send(Msg::Radio { page_gen, idx: i }));
                     Some(Ctl::Radio(w))
                 }
                 ControlKind::Submit { label, .. } => {
-                    let mut w = Button::default().with_label(&label.replace('@', "@@"));
+                    let mut w = Button::default().with_label(&label_escape(label));
                     if let Some(m) = submit(Some(i)) {
-                        w.set_callback(move |_| s.send(m.clone()));
+                        w.set_callback(move |_| s.send(m));
                     }
                     Some(Ctl::Button(w))
                 }
                 ControlKind::Button { label } => {
-                    let mut w = Button::default().with_label(&label.replace('@', "@@"));
+                    let mut w = Button::default().with_label(&label_escape(label));
                     w.deactivate();
                     Some(Ctl::Button(w))
                 }
-                ControlKind::Select { options, selected } => {
-                    let mut w = Choice::default();
-                    for (label, _) in options {
-                        let esc = label
-                            .replace('\\', "\\\\")
-                            .replace('/', "\\/")
-                            .replace('&', "&&")
-                            .replace('|', " ");
-                        w.add_choice(if esc.is_empty() { " " } else { &esc });
+                ControlKind::Select { options, selected, multiple, size } => {
+                    if *multiple || size.is_some_and(|n| n > 1) {
+                        let mut w = MultiBrowser::default();
+                        for o in options {
+                            // "@." = print the rest literally (Fl_Browser format codes start with '@').
+                            w.add(&format!("@.{}", o.label));
+                        }
+                        for &k in selected {
+                            if let Ok(line) = i32::try_from(k + 1) {
+                                w.select(line);
+                            }
+                        }
+                        Some(Ctl::List(w))
+                    } else {
+                        let mut w = Choice::default();
+                        for o in options {
+                            let esc = o
+                                .label
+                                .replace('\\', "\\\\")
+                                .replace('/', "\\/")
+                                .replace('&', "&&")
+                                .replace('|', " ")
+                                .replace('@', "@@"); // AUDIT FIX: '@' is a symbol prefix in menu labels too
+                            w.add_choice(if esc.is_empty() { " " } else { &esc });
+                        }
+                        // AUDIT FIX: `selected as i32` could wrap; use a checked conversion.
+                        if let Some(k) = selected.first().and_then(|&k| i32::try_from(k).ok()) {
+                            w.set_value(k);
+                        }
+                        Some(Ctl::Choice(w))
                     }
-                    w.set_value(*selected as i32);
-                    Some(Ctl::Choice(w))
                 }
             };
             if let Some(c) = &mut ctl {
@@ -529,6 +729,7 @@ impl Browser {
                     Ctl::Radio(w) => intercept_page_keys(w, sc, l),
                     Ctl::Button(w) => intercept_page_keys(w, sc, l),
                     Ctl::Choice(w) => intercept_page_keys(w, sc, l),
+                    Ctl::List(w) => intercept_page_keys(w, sc, l),
                 }
                 let mut base = c.base();
                 base.set_label_size(13);
@@ -541,9 +742,16 @@ impl Browser {
         self.scroll.end();
         self.scroll.scroll_to(0, 0);
         self.relayout();
-        // Focus the first text field (like DDG's autofocus).
-        if let Some(Some(Ctl::Text(w))) = self.widgets.iter().find(|w| matches!(w, Some(Ctl::Text(_)))) {
-            let _ = w.clone().take_focus();
+        // AUDIT FIX: focus only an `autofocus` control (was: always the first text field, which
+        // swallowed Space/arrow keys meant to scroll); otherwise the page itself gets focus.
+        let auto = self.page.controls.iter().position(|c| c.autofocus && !c.disabled);
+        match auto.and_then(|i| self.widgets.get(i)).and_then(Option::as_ref) {
+            Some(w) => {
+                let _ = w.base().take_focus();
+            }
+            None => {
+                let _ = self.canvas.take_focus();
+            }
         }
     }
 
@@ -553,8 +761,9 @@ impl Browser {
             0 => app::scrollbar_size(),
             n => n,
         };
-        let width = self.scroll.w() - sb;
-        let mut l = layout::layout(&self.page.items, &self.page.controls, width);
+        // AUDIT FIX: a collapsed window gave a negative canvas width.
+        let width = (self.scroll.w() - sb).max(1);
+        let mut l = layout::layout(&self.page.items, &self.page.controls, width, &mut layout::FltkMeasure);
         l.viewport = (self.scroll.w(), self.scroll.h());
         let height = l.height.max(self.scroll.h());
         let ypos = self.scroll.yposition().min((height - self.scroll.h()).max(0));
@@ -571,10 +780,13 @@ impl Browser {
     }
 
     fn radio_toggled(&mut self, i: usize) {
-        let (form, name) = {
-            let c = &self.page.controls[i];
-            (c.form, c.name.clone())
+        // AUDIT FIX: was `controls[i]` (panic on a stale index); see Msg.
+        let Some((form, name)) = self.page.controls.get(i).map(|c| (c.form, c.name.clone())) else {
+            return;
         };
+        if name.is_empty() {
+            return; // unnamed radios aren't grouped
+        }
         for (j, spec) in self.page.controls.iter().enumerate() {
             if let (ControlKind::Radio { .. }, Some(Some(Ctl::Radio(w)))) = (&spec.kind, self.widgets.get(j)) {
                 if spec.form == form && spec.name == name {
@@ -587,6 +799,9 @@ impl Browser {
     /// HTML form submission: collect successful controls in tree order.
     fn form_submission(&self, form: usize, submitter: Option<usize>) -> Option<Request> {
         let spec = self.page.forms.get(form)?;
+        if spec.dialog {
+            return None; // method=dialog closes a <dialog>; nothing to send
+        }
         // Implicit submission (Enter) uses the form's first submit button as submitter.
         let submitter = submitter.or_else(|| {
             self.page
@@ -596,7 +811,29 @@ impl Browser {
         });
         let mut pairs = Vec::new();
         for (i, c) in self.page.controls.iter().enumerate() {
-            if c.form != Some(form) || c.disabled || c.name.is_empty() {
+            if c.form != Some(form) || c.disabled {
+                continue;
+            }
+            // AUDIT FIX: image buttons submit click coordinates as name.x/name.y (or x/y unnamed).
+            if let ControlKind::Submit { image: true, .. } = c.kind {
+                if submitter == Some(i) {
+                    let prefix = if c.name.is_empty() { String::new() } else { format!("{}.", c.name) };
+                    pairs.push((format!("{prefix}x"), "0".into()));
+                    pairs.push((format!("{prefix}y"), "0".into()));
+                }
+                continue;
+            }
+            if c.name.is_empty() {
+                continue;
+            }
+            let widget = self.widgets.get(i).and_then(Option::as_ref);
+            // AUDIT FIX: multi-selects submit one pair per selected option.
+            if let (ControlKind::Select { options, .. }, Some(Ctl::List(w))) = (&c.kind, widget) {
+                for (k, o) in options.iter().enumerate() {
+                    if i32::try_from(k + 1).is_ok_and(|line| w.selected(line)) && !o.disabled {
+                        pairs.push((c.name.clone(), o.value.clone()));
+                    }
+                }
                 continue;
             }
             let widget = self.widgets.get(i).and_then(Option::as_ref);
@@ -612,7 +849,8 @@ impl Browser {
                 (ControlKind::Select { options, .. }, Some(Ctl::Choice(w))) => usize::try_from(w.value())
                     .ok()
                     .and_then(|k| options.get(k))
-                    .map(|(_, v)| v.clone()),
+                    .filter(|o| !o.disabled)
+                    .map(|o| o.value.clone()),
                 (ControlKind::Submit { value, .. }, _) if submitter == Some(i) => Some(value.clone()),
                 _ => None,
             };
@@ -620,7 +858,36 @@ impl Browser {
                 pairs.push((c.name.clone(), v));
             }
         }
+        // AUDIT FIX: honour the submitter's formaction/formmethod/formenctype.
+        let mut spec = spec.clone();
+        if let Some(ControlKind::Submit { overrides, .. }) = submitter.and_then(|i| self.page.controls.get(i)).map(|c| &c.kind) {
+            if let Some(a) = &overrides.action {
+                spec.action = a.clone();
+            }
+            spec.post = overrides.post.unwrap_or(spec.post);
+            spec.multipart = overrides.multipart.unwrap_or(spec.multipart);
+        }
         let referer = self.current.as_ref().map(|r| r.url.clone());
-        Some(net::form_request(spec, &pairs, referer))
+        Some(net::form_request(&spec, &pairs, referer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omnibox() {
+        let u = |s: &str| omnibox_url(s).map(|u| u.to_string());
+        assert_eq!(u("example.com/x").as_deref(), Some("https://example.com/x"));
+        assert_eq!(u("http://a.b/").as_deref(), Some("http://a.b/"));
+        assert_eq!(u("localhost:8080").as_deref(), Some("https://localhost:8080/"));
+        assert_eq!(u("rust fltk").as_deref(), Some("https://lite.duckduckgo.com/lite/?q=rust+fltk"));
+        assert_eq!(u("   "), None);
+    }
+
+    #[test]
+    fn labels_escape_at_signs() {
+        assert_eq!(label_escape("https://x.com/@user"), "https://x.com/@@user");
     }
 }
