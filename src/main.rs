@@ -70,9 +70,9 @@ fn main() -> Result<()> {
     status.set_frame(FrameType::FlatBox);
     status.set_color(Color::from_rgb(40, 40, 40));
 
-    let mut buffer = TextBuffer::default();
+    let buffer = TextBuffer::default();
     let mut content = TextDisplay::new(10, 80, 880, 540, "");
-    content.set_buffer(buffer.clone());
+    content.set_buffer(buffer);
     content.set_color(Color::from_rgb(25, 25, 25));
     content.set_text_color(Color::from_rgb(220, 220, 220));
     content.set_text_font(Font::Courier);
@@ -82,7 +82,7 @@ fn main() -> Result<()> {
     win.end();
     win.show();
 
-    // quickjs-rusty 0.15: prefer builder (new() now takes memory_limit)
+    // quickjs-rusty 0.15: use builder
     let js_ctx = JsContext::builder()
         .build()
         .context("Failed to create QuickJS context")?;
@@ -97,10 +97,11 @@ fn main() -> Result<()> {
         true
     })?;
 
+    // Build state with clones of the widgets (FLTK widgets are cloneable handles)
     let state = Rc::new(RefCell::new(BrowserState {
-        url_input,
-        content,
-        status,
+        url_input: url_input.clone(),
+        content: content.clone(),
+        status: status.clone(),
         js_ctx,
     }));
 
@@ -110,7 +111,9 @@ fn main() -> Result<()> {
         if let Err(e) = navigate(&state_clone, &url) {
             let mut st = state_clone.borrow_mut();
             st.status.set_label(&format!("Error: {}", e));
-            st.content.buffer().unwrap().set_text(&format!("Navigation failed:\n{}", e));
+            if let Some(mut buf) = st.content.buffer() {
+                buf.set_text(&format!("Navigation failed:\n{}", e));
+            }
         }
     });
 
@@ -131,7 +134,7 @@ fn main() -> Result<()> {
 fn navigate(state: &Rc<RefCell<BrowserState>>, raw_url: &str) -> Result<()> {
     let mut st = state.borrow_mut();
     st.status.set_label("Fetching…");
-    app::awake(); // force UI update
+    app::awake();
 
     let url = Url::parse(raw_url).context("Invalid URL")?;
     let client = Client::builder()
@@ -148,24 +151,23 @@ fn navigate(state: &Rc<RefCell<BrowserState>>, raw_url: &str) -> Result<()> {
 
     let (title, text, scripts, styles) = parse_html(&body)?;
 
-    // Apply CSS (basic: just log or extract rules; full cascade is future work)
     if !styles.is_empty() {
         for css in &styles {
             match StyleSheet::parse(css, ParserOptions::default()) {
                 Ok(sheet) => {
                     log::info!("Parsed CSS stylesheet with {} rules", sheet.rules.0.len());
-                    // Future: apply computed styles to nodes
                 }
                 Err(e) => log::warn!("CSS parse error: {:?}", e),
             }
         }
     }
 
-    // Run scripts — eval takes (code, resolve_modules)
     for script in scripts {
         if let Err(e) = st.js_ctx.eval(&script, false) {
             log::warn!("JS error: {}", e);
-            st.content.buffer().unwrap().append(&format!("\n[JS Error] {}\n", e));
+            if let Some(mut buf) = st.content.buffer() {
+                buf.append(&format!("\n[JS Error] {}\n", e));
+            }
         }
     }
 
@@ -175,7 +177,9 @@ fn navigate(state: &Rc<RefCell<BrowserState>>, raw_url: &str) -> Result<()> {
         format!("Title: {}\n\n{}", title.unwrap_or_else(|| "(no title)".into()), text)
     };
 
-    st.content.buffer().unwrap().set_text(&display);
+    if let Some(mut buf) = st.content.buffer() {
+        buf.set_text(&display);
+    }
     st.status.set_label(&format!("Loaded {} — {} chars", url.host_str().unwrap_or(""), display.len()));
     Ok(())
 }
