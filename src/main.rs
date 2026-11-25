@@ -82,15 +82,19 @@ fn main() -> Result<()> {
     win.end();
     win.show();
 
-    let js_ctx = JsContext::new().context("Failed to create QuickJS context")?;
-    // Basic host bindings — closures must return a value to implement Callback
+    // quickjs-rusty 0.15: prefer builder (new() now takes memory_limit)
+    let js_ctx = JsContext::builder()
+        .build()
+        .context("Failed to create QuickJS context")?;
+
+    // Callbacks must return a value implementing IntoCallbackResult
     js_ctx.add_callback("alert", |msg: String| {
         fltk::dialog::alert_default(&msg);
-        ()
+        true
     })?;
     js_ctx.add_callback("consoleLog", |msg: String| {
         eprintln!("[JS] {}", msg);
-        ()
+        true
     })?;
 
     let state = Rc::new(RefCell::new(BrowserState {

@@ -10,7 +10,6 @@ fltk = { version = "1.5", features = ["fltk-bundled"] }  # bundled for easy cros
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "gzip", "brotli"] }
 html5ever = "0.40"
 markup5ever_rcdom = "0.40"
-tendril = "0.4"
 lightningcss = "1.0.0-alpha"
 quickjs-rusty = "0.15"
 anyhow = "1.0"
