@@ -1,0 +1,25 @@
+[package]
+name = "mini-ladybird"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal cross-platform browser clone inspired by Ladybird architecture, using Rust + FLTK"
+license = "MIT"
+
+[dependencies]
+fltk = { version = "1.5", features = ["fltk-bundled"] }  # bundled for easy cross-platform
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "gzip", "brotli"] }
+html5ever = "0.40"
+markup5ever_rcdom = "0.40"
+tendril = "0.4"
+lightningcss = "1.0.0-alpha"
+quickjs-rusty = "0.15"
+anyhow = "1.0"
+url = "2.5"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true
