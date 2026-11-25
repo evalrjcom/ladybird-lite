@@ -7,15 +7,19 @@ license = "MIT"
 
 [dependencies]
 fltk = { version = "1.5", features = ["fltk-bundled"] }  # bundled for easy cross-platform
-reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "gzip", "brotli", "cookies"] }
+# AUDIT FIX: default features also pulled in native-tls/OpenSSL (two TLS stacks, extra libssl
+# runtime dependency on Linux); rustls only now. + "multipart" for enctype=multipart/form-data forms.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "http2", "gzip", "brotli", "cookies", "multipart"] }
 html5ever = "0.40"
 markup5ever_rcdom = "0.40"
-lightningcss = "1.0.0-alpha"
+lightningcss = "1.0.0-alpha"  # pre-release: exact version pinned by the now-committed Cargo.lock
 quickjs-rusty = "0.15"
 anyhow = "1.0"
 url = "2.5"
 log = "0.4"
 env_logger = "0.11"
+# AUDIT FIX: decode non-UTF-8 pages (<meta charset>, windows-1252, Shift_JIS, …); already in the tree via reqwest.
+encoding_rs = "0.8"
 
 [profile.release]
 lto = true
