@@ -97,6 +97,11 @@ All of this is implemented from web standards (no Blink/WebKit/Gecko code).
   action's query) or `POST` (request body), `action` resolved against the page URL (empty → current
   page). Pressing **Enter in a text field submits its form** (implicit submission uses the first
   submit button as submitter). Example: open `https://duckduckgo.com/lite/`, type a query, press Enter.
+- **Keyboard scrolling that works whatever has focus**: PageDown/PageUp scroll one screen (minus a
+  40px overlap) even while typing in the search box or the URL bar; Home/End, ↑/↓ and
+  Space/Shift+Space scroll when focus isn't in a text field (click the page text to leave a field).
+  A `<textarea>` keeps PageUp/PageDown only when its own text overflows. The mouse wheel scrolls
+  ~3 lines per notch. Logic and unit tests live in `src/scrolling.rs`.
 - Parse CSS with lightningcss; execute inline `<script>` in QuickJS (`alert()`, `consoleLog()`)
 - Dark themed FLTK UI
 

@@ -17,6 +17,7 @@
 mod layout;
 mod net;
 mod page;
+mod scrolling;
 
 use anyhow::{Context, Result};
 use fltk::{
@@ -142,6 +143,11 @@ fn main() -> Result<()> {
     let mut canvas = Frame::default();
     canvas.set_frame(FrameType::NoBox);
     scroll.end();
+    // Mouse wheel: ~3 lines per notch instead of FLTK's 16px default.
+    scroll.scrollbar().set_linesize(scrolling::LINE_STEP);
+    // Scrollbars must not grab keyboard focus (they'd then eat page keys with their own rules).
+    scroll.scrollbar().clear_visible_focus();
+    scroll.hscrollbar().clear_visible_focus();
     col.end();
     win.end();
     win.resizable(&col);
@@ -168,6 +174,7 @@ fn main() -> Result<()> {
     {
         let l = layout.clone();
         let s = sender;
+        let mut sc = scroll.clone();
         canvas.handle(move |c, ev| {
             let hit = || layout::link_at(&l.borrow(), app::event_x() - c.x(), app::event_y() - c.y());
             match ev {
@@ -185,7 +192,17 @@ fn main() -> Result<()> {
                     }
                     true
                 }
-                Event::Push => hit().is_some(),
+                // The page itself can hold focus (like a browser's document), so clicking
+                // text leaves a form field and Space/arrows scroll the page again.
+                Event::Focus | Event::Unfocus => true,
+                // Handle page keys here, before FLTK's group arrow-key focus navigation.
+                Event::KeyDown => page_key(&mut sc, &l),
+                Event::Push => {
+                    if hit().is_none() {
+                        let _ = c.take_focus();
+                    }
+                    true
+                }
                 Event::Released => {
                     if let Some(i) = hit() {
                         s.send(Msg::Link(i));
@@ -196,6 +213,20 @@ fn main() -> Result<()> {
             }
         });
     }
+
+    // Page keyboard scrolling regardless of focus: FLTK delivers keys to the focused
+    // widget first, so every focusable widget (and the window, for the rest) gets a
+    // pre-handler that runs before FLTK's default handling.
+    // With nothing focused, FLTK offers the key to the window as a Shortcut event.
+    {
+        win.super_handle_first(false);
+        let mut sc = scroll.clone();
+        let l = layout.clone();
+        win.handle(move |_, ev| matches!(ev, Event::KeyDown | Event::Shortcut) && page_key(&mut sc, &l));
+    }
+    intercept_page_keys(&mut url_input, &scroll, &layout);
+    intercept_page_keys(&mut back_btn, &scroll, &layout);
+    intercept_page_keys(&mut go_btn, &scroll, &layout);
 
     back_btn.emit(sender, Msg::Back);
     go_btn.emit(sender, Msg::Go);
@@ -241,6 +272,61 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run [`page_key`] before `w`'s own key handling.
+fn intercept_page_keys<W: WidgetBase>(w: &mut W, scroll: &Scroll, layout: &Rc<RefCell<Layout>>) {
+    w.super_handle_first(false);
+    let mut sc = scroll.clone();
+    let l = layout.clone();
+    w.handle(move |_, ev| ev == Event::KeyDown && page_key(&mut sc, &l));
+}
+
+/// If the current key should scroll the page (given what has focus), scroll and consume it.
+fn page_key(sc: &mut Scroll, layout: &Rc<RefCell<Layout>>) -> bool {
+    if app::grab().is_some() {
+        return false; // a popup menu (e.g. an open <select>) owns the keyboard
+    }
+    let focus = app::focus().map_or(scrolling::Focus::Page, |w| classify_focus(&w.as_base_widget()));
+    let Some(action) = scrolling::action_for(app::event_key(), app::is_event_shift(), focus) else {
+        return false;
+    };
+    let content_h = layout.borrow().height;
+    let cur = sc.yposition();
+    let to = scrolling::target(action, cur, content_h, sc.h());
+    log::debug!("scroll {action:?} focus={focus:?} y {cur} -> {to} (content {content_h}, view {})", sc.h());
+    if to != cur {
+        sc.scroll_to(0, to);
+        sc.redraw();
+    }
+    true
+}
+
+/// Classify the focused widget for keyboard-scroll decisions.
+fn classify_focus(w: &Widget) -> scrolling::Focus {
+    use fltk::utils::is_ptr_of;
+    use scrolling::Focus;
+    let p = w.as_widget_ptr();
+    if is_ptr_of::<MultilineInput>(p) {
+        // Does the text overflow the box (so the textarea needs its own PageUp/Down)?
+        let ta = unsafe { MultilineInput::from_widget_ptr(p) };
+        fltk::draw::set_font(ta.text_font(), ta.text_size());
+        let inner_w = (ta.w() - 8).max(1) as f64;
+        let lines: i32 = ta
+            .value()
+            .split('\n')
+            .map(|line| ((fltk::draw::width(line) / inner_w).ceil() as i32).max(1))
+            .sum();
+        Focus::TextArea { scrollable: lines * fltk::draw::height() > ta.h() - 4 }
+    } else if is_ptr_of::<Input>(p) || is_ptr_of::<SecretInput>(p) {
+        Focus::TextField
+    } else if is_ptr_of::<Choice>(p) {
+        Focus::Choice
+    } else if is_ptr_of::<Button>(p) || is_ptr_of::<CheckButton>(p) || is_ptr_of::<RoundButton>(p) {
+        Focus::Button
+    } else {
+        Focus::Page
+    }
 }
 
 impl Browser {
@@ -363,7 +449,7 @@ impl Browser {
         for (i, spec) in self.page.controls.iter().enumerate() {
             let form = spec.form;
             let submit = move |submitter: Option<usize>| form.map(|form| Msg::Submit { form, submitter });
-            let ctl = match &spec.kind {
+            let mut ctl = match &spec.kind {
                 ControlKind::Hidden { .. } => None,
                 ControlKind::Text { value, password, .. } => {
                     // Enter in a text field submits its form (implicit submission).
@@ -433,7 +519,17 @@ impl Browser {
                     Some(Ctl::Choice(w))
                 }
             };
-            if let Some(c) = &ctl {
+            if let Some(c) = &mut ctl {
+                let (sc, l) = (&self.scroll, &self.layout);
+                match c {
+                    Ctl::Text(w) => intercept_page_keys(w, sc, l),
+                    Ctl::Secret(w) => intercept_page_keys(w, sc, l),
+                    Ctl::Area(w) => intercept_page_keys(w, sc, l),
+                    Ctl::Check(w) => intercept_page_keys(w, sc, l),
+                    Ctl::Radio(w) => intercept_page_keys(w, sc, l),
+                    Ctl::Button(w) => intercept_page_keys(w, sc, l),
+                    Ctl::Choice(w) => intercept_page_keys(w, sc, l),
+                }
                 let mut base = c.base();
                 base.set_label_size(13);
                 if spec.disabled {
