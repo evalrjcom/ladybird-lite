@@ -28,7 +28,6 @@ use fltk::{
 use html5ever::{parse_document, tendril::TendrilSink, ParseOpts};
 use lightningcss::{
     stylesheet::{ParserOptions, StyleSheet},
-    targets::Targets,
 };
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use quickjs_rusty::Context as JsContext;
@@ -84,12 +83,14 @@ fn main() -> Result<()> {
     win.show();
 
     let js_ctx = JsContext::new().context("Failed to create QuickJS context")?;
-    // Basic host bindings
+    // Basic host bindings — closures must return a value to implement Callback
     js_ctx.add_callback("alert", |msg: String| {
         fltk::dialog::alert_default(&msg);
+        ()
     })?;
     js_ctx.add_callback("consoleLog", |msg: String| {
         eprintln!("[JS] {}", msg);
+        ()
     })?;
 
     let state = Rc::new(RefCell::new(BrowserState {
@@ -156,9 +157,9 @@ fn navigate(state: &Rc<RefCell<BrowserState>>, raw_url: &str) -> Result<()> {
         }
     }
 
-    // Run scripts
+    // Run scripts — eval takes (code, resolve_modules)
     for script in scripts {
-        if let Err(e) = st.js_ctx.eval(&script) {
+        if let Err(e) = st.js_ctx.eval(&script, false) {
             log::warn!("JS error: {}", e);
             st.content.buffer().unwrap().append(&format!("\n[JS Error] {}\n", e));
         }
@@ -200,7 +201,7 @@ fn parse_html(html: &str) -> Result<(Option<String>, String, Vec<String>, Vec<St
         let node = handle;
         match &node.data {
             NodeData::Element { name, .. } => {
-                let local = name.local.as_ref();
+                let local: &str = name.local.as_ref();
                 let is_title = local.eq_ignore_ascii_case("title");
                 let is_script = local.eq_ignore_ascii_case("script");
                 let is_style = local.eq_ignore_ascii_case("style");
